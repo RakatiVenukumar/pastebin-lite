@@ -101,3 +101,88 @@ def get_paste(
                  .isoformat() + "Z"
         )
     }
+
+from fastapi import HTTPException, Path
+from datetime import datetime
+
+@router.get("/api/pastes/{paste_id}")
+def get_paste(
+    paste_id: str = Path(..., min_length=1),
+    request: Request = None
+):
+    key = f"paste:{paste_id}"
+
+    raw = redis_client.get(key)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Paste not found")
+
+    paste = json.loads(raw)
+    now = now_ms(request)
+
+    # ⏰ Check TTL expiry
+    if paste["expires_at"] is not None and now > paste["expires_at"]:
+        redis_client.delete(key)
+        raise HTTPException(status_code=404, detail="Paste expired")
+
+    # 👀 Check view limit
+    max_views = paste["max_views"]
+    views = paste["views"]
+
+    if max_views is not None and views >= max_views:
+        raise HTTPException(status_code=404, detail="View limit exceeded")
+
+    # ✅ Increment views
+    paste["views"] += 1
+    redis_client.set(key, json.dumps(paste))
+
+    # Remaining views
+    remaining_views = None
+    if max_views is not None:
+        remaining_views = max_views - paste["views"]
+
+    # Expiry time formatting
+    expires_at = None
+    if paste["expires_at"] is not None:
+        expires_at = (
+            datetime.utcfromtimestamp(paste["expires_at"] / 1000)
+            .isoformat() + "Z"
+        )
+
+    return {
+        "content": paste["content"],
+        "remaining_views": remaining_views,
+        "expires_at": expires_at
+    }
+
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+
+templates = Jinja2Templates(directory="app/templates")
+
+@router.get("/p/{paste_id}", response_class=HTMLResponse)
+def view_paste(paste_id: str, request: Request):
+    key = f"paste:{paste_id}"
+    raw = redis_client.get(key)
+
+    if not raw:
+        return HTMLResponse("Paste not found", status_code=404)
+
+    paste = json.loads(raw)
+    now = now_ms(request)
+
+    # Check expiry
+    if paste["expires_at"] is not None and now > paste["expires_at"]:
+        redis_client.delete(key)
+        return HTMLResponse("Paste expired", status_code=404)
+
+    # Check view limit (DO NOT increment views)
+    if paste["max_views"] is not None and paste["views"] >= paste["max_views"]:
+        return HTMLResponse("Paste unavailable", status_code=404)
+
+    return templates.TemplateResponse(
+        "paste.html",
+        {
+            "request": request,
+            "content": paste["content"]
+        }
+    )
